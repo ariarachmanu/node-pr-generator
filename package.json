@@ -1,0 +1,32 @@
+{
+  "name": "pr-generator",
+  "version": "1.0.0",
+  "description": "AI-powered PR Title & Description Generator using Google AI Gemini API",
+  "main": "generate-pr.js",
+  "scripts": {
+    "start": "node generate-pr.js",
+    "generate": "node generate-pr.js"
+  },
+  "keywords": [
+    "pr",
+    "pull-request",
+    "generator",
+    "ai",
+    "gemini",
+    "git",
+    "automation"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=12.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "bin": {
+    "generate-pr": "./generate-pr.js"
+  }
+}
+
