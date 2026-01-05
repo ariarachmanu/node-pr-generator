@@ -62,6 +62,7 @@ const GOOGLE_AI_API_KEY = process.env.GOOGLE_AI_API_KEY || envVars.GOOGLE_AI_API
 // Try gemini-pro first (most stable), fallback to gemini-1.5-pro if needed
 const MODEL_NAME = process.env.GEMINI_MODEL || envVars.GEMINI_MODEL || 'gemini-2.5-flash';
 const MAX_OUTPUT_TOKENS = process.env.MAX_OUTPUT_TOKENS || envVars.MAX_OUTPUT_TOKENS || 4096;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || envVars.GITHUB_TOKEN || null;
 
 /**
  * Get git diff of staged changes
@@ -92,6 +93,41 @@ function getBranchName() {
   } catch (error) {
     return 'main';
   }
+}
+
+/**
+ * Parse command line arguments
+ */
+function parseCommandLineArgs() {
+  const args = process.argv.slice(2);
+  const config = {
+    targetBranch: null,
+    autoCreate: false,
+    draft: false,
+    skipTemplate: false,
+    showHelp: false
+  };
+  
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--target' || args[i] === '-t') {
+      if (i + 1 < args.length) {
+        config.targetBranch = args[i + 1];
+        i++;
+      } else {
+        console.log('⚠️  Warning: --target requires a branch name');
+      }
+    } else if (args[i] === '--auto' || args[i] === '-a') {
+      config.autoCreate = true;
+    } else if (args[i] === '--draft' || args[i] === '-d') {
+      config.draft = true;
+    } else if (args[i] === '--no-template') {
+      config.skipTemplate = true;
+    } else if (args[i] === '--help' || args[i] === '-h') {
+      config.showHelp = true;
+    }
+  }
+  
+  return config;
 }
 
 /**
@@ -444,6 +480,93 @@ function extractIssueCodeFromBranch(branchName) {
 }
 
 /**
+ * Get GitHub repository info from git remote
+ */
+function getGitHubRepoInfo() {
+  try {
+    const remoteUrl = execSync('git remote get-url origin', { encoding: 'utf-8' }).trim();
+    
+    // Handle both SSH and HTTPS formats
+    // SSH: git@github.com:owner/repo.git
+    // HTTPS: https://github.com/owner/repo.git
+    // HTTPS with .git: https://github.com/owner/repo.git
+    const match = remoteUrl.match(/(?:github\.com[:/])([^/]+)\/([^/]+?)(?:\.git)?$/);
+    if (match) {
+      return {
+        owner: match[1],
+        repo: match[2].replace('.git', '')
+      };
+    }
+    return null;
+  } catch (error) {
+    console.log('⚠️  Could not get GitHub repo info:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Get target branch (base branch) with multiple strategies
+ */
+function getTargetBranch(sourceBranch, cliTargetBranch = null) {
+  // Priority 1: CLI argument
+  if (cliTargetBranch) {
+    console.log(`📌 Target branch (from CLI): ${cliTargetBranch}`);
+    return cliTargetBranch;
+  }
+  
+  // Priority 2: Git config (branch.{branch}.merge)
+  try {
+    const mergeConfig = execSync(
+      `git config branch.${sourceBranch}.merge 2>/dev/null`,
+      { encoding: 'utf-8', stdio: 'pipe' }
+    ).trim();
+    
+    if (mergeConfig) {
+      // Extract branch name from refs/heads/branch-name
+      const branchMatch = mergeConfig.match(/refs\/heads\/(.+)$/);
+      if (branchMatch) {
+        console.log(`📌 Target branch (from git config): ${branchMatch[1]}`);
+        return branchMatch[1];
+      }
+    }
+  } catch (e) {
+    // Config not set, continue
+  }
+  
+  // Priority 3: Get default branch from remote HEAD
+  try {
+    const defaultBranch = execSync(
+      'git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null',
+      { encoding: 'utf-8', stdio: 'pipe' }
+    ).trim();
+    
+    if (defaultBranch) {
+      const branchName = defaultBranch.replace('refs/remotes/origin/', '');
+      console.log(`📌 Target branch (default): ${branchName}`);
+      return branchName;
+    }
+  } catch (e) {
+    // Fallback to common names
+  }
+  
+  // Priority 4: Try common branch names
+  const commonBranches = ['main', 'master', 'develop', 'dev'];
+  for (const branch of commonBranches) {
+    try {
+      execSync(`git rev-parse --verify origin/${branch}`, { stdio: 'ignore' });
+      console.log(`📌 Target branch (detected): ${branch}`);
+      return branch;
+    } catch (e) {
+      continue;
+    }
+  }
+  
+  // Final fallback
+  console.log(`📌 Target branch (fallback): main`);
+  return 'main';
+}
+
+/**
  * Get system environment information
  */
 function getEnvironmentInfo() {
@@ -523,6 +646,285 @@ function getEnvironmentInfo() {
   }
   
   return envInfo;
+}
+
+/**
+ * Create PR on GitHub using REST API
+ */
+function createGitHubPR(title, body, headBranch, baseBranch, repoInfo, draft = false) {
+  return new Promise((resolve, reject) => {
+    if (!GITHUB_TOKEN) {
+      reject(new Error('GITHUB_TOKEN not found. Please set it in .env file or environment variable.'));
+      return;
+    }
+    
+    const requestBody = {
+      title: title,
+      body: body,
+      head: headBranch,
+      base: baseBranch,
+      draft: draft
+    };
+    
+    const data = JSON.stringify(requestBody);
+    const dataBuffer = Buffer.from(data, 'utf-8');
+    
+    const options = {
+      hostname: 'api.github.com',
+      port: 443,
+      path: `/repos/${repoInfo.owner}/${repoInfo.repo}/pulls`,
+      method: 'POST',
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'User-Agent': 'PR-Generator',
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+        'Content-Length': dataBuffer.length
+      }
+    };
+    
+    const req = https.request(options, (res) => {
+      let responseData = '';
+      
+      res.on('data', (chunk) => {
+        responseData += chunk;
+      });
+      
+      res.on('end', () => {
+        if (res.statusCode === 201) {
+          const result = JSON.parse(responseData);
+          resolve(result);
+        } else if (res.statusCode === 422) {
+          // PR might already exist, try to update it
+          try {
+            const error = JSON.parse(responseData);
+            const errorMessage = error.message || (error.errors && error.errors[0] && error.errors[0].message) || '';
+            
+            if (errorMessage.includes('already exists') || errorMessage.includes('pull request already exists')) {
+              console.log('   ℹ️  PR already exists, updating existing PR...');
+              // Try to find and update existing PR
+              findExistingPR(headBranch, baseBranch, repoInfo)
+                .then(existingPR => {
+                  updateGitHubPR(existingPR.number, title, body, repoInfo)
+                    .then(resolve)
+                    .catch(reject);
+                })
+                .catch(() => {
+                  reject(new Error(`PR already exists but could not be updated: ${errorMessage}`));
+                });
+            } else {
+              reject(new Error(`GitHub API error: ${res.statusCode} - ${errorMessage || responseData}`));
+            }
+          } catch (parseError) {
+            reject(new Error(`GitHub API error: ${res.statusCode} - ${responseData}`));
+          }
+        } else {
+          try {
+            const error = JSON.parse(responseData);
+            const errorMessage = error.message || (error.errors && error.errors[0] && error.errors[0].message) || responseData;
+            reject(new Error(`GitHub API error: ${res.statusCode} - ${errorMessage}`));
+          } catch (parseError) {
+            reject(new Error(`GitHub API error: ${res.statusCode} - ${responseData}`));
+          }
+        }
+      });
+    });
+    
+    req.on('error', (error) => {
+      reject(error);
+    });
+    
+    req.write(dataBuffer);
+    req.end();
+  });
+}
+
+/**
+ * Find existing PR by branch
+ */
+function findExistingPR(headBranch, baseBranch, repoInfo) {
+  return new Promise((resolve, reject) => {
+    if (!GITHUB_TOKEN) {
+      reject(new Error('GITHUB_TOKEN not found'));
+      return;
+    }
+    
+    const options = {
+      hostname: 'api.github.com',
+      port: 443,
+      path: `/repos/${repoInfo.owner}/${repoInfo.repo}/pulls?head=${repoInfo.owner}:${headBranch}&state=open`,
+      method: 'GET',
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'User-Agent': 'PR-Generator',
+        'Accept': 'application/vnd.github.v3+json'
+      }
+    };
+    
+    const req = https.request(options, (res) => {
+      let responseData = '';
+      
+      res.on('data', (chunk) => {
+        responseData += chunk;
+      });
+      
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          const prs = JSON.parse(responseData);
+          if (prs.length > 0) {
+            resolve(prs[0]);
+          } else {
+            reject(new Error('PR not found'));
+          }
+        } else {
+          reject(new Error(`GitHub API error: ${res.statusCode} - ${responseData}`));
+        }
+      });
+    });
+    
+    req.on('error', (error) => {
+      reject(error);
+    });
+    
+    req.end();
+  });
+}
+
+/**
+ * Update existing PR
+ */
+function updateGitHubPR(prNumber, title, body, repoInfo) {
+  return new Promise((resolve, reject) => {
+    if (!GITHUB_TOKEN) {
+      reject(new Error('GITHUB_TOKEN not found'));
+      return;
+    }
+    
+    const requestBody = {
+      title: title,
+      body: body
+    };
+    
+    const data = JSON.stringify(requestBody);
+    const dataBuffer = Buffer.from(data, 'utf-8');
+    
+    const options = {
+      hostname: 'api.github.com',
+      port: 443,
+      path: `/repos/${repoInfo.owner}/${repoInfo.repo}/pulls/${prNumber}`,
+      method: 'PATCH',
+      headers: {
+        'Authorization': `token ${GITHUB_TOKEN}`,
+        'User-Agent': 'PR-Generator',
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+        'Content-Length': dataBuffer.length
+      }
+    };
+    
+    const req = https.request(options, (res) => {
+      let responseData = '';
+      
+      res.on('data', (chunk) => {
+        responseData += chunk;
+      });
+      
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          const result = JSON.parse(responseData);
+          resolve(result);
+        } else {
+          reject(new Error(`GitHub API error: ${res.statusCode} - ${responseData}`));
+        }
+      });
+    });
+    
+    req.on('error', (error) => {
+      reject(error);
+    });
+    
+    req.write(dataBuffer);
+    req.end();
+  });
+}
+
+/**
+ * Validate GitHub setup
+ */
+function validateGitHubSetup() {
+  if (!GITHUB_TOKEN) {
+    return {
+      valid: false,
+      error: 'GITHUB_TOKEN not found',
+      message: 'Please set GITHUB_TOKEN in .env file or environment variable.\n   Get your token at: https://github.com/settings/tokens\n   Required scope: repo'
+    };
+  }
+  
+  const repoInfo = getGitHubRepoInfo();
+  if (!repoInfo) {
+    return {
+      valid: false,
+      error: 'Not a GitHub repository',
+      message: 'Could not detect GitHub repository. Make sure you have a GitHub remote configured.'
+    };
+  }
+  
+  return {
+    valid: true,
+    repoInfo: repoInfo
+  };
+}
+
+/**
+ * Validate target branch exists on remote
+ */
+function validateTargetBranch(targetBranch) {
+  try {
+    execSync(`git rev-parse --verify origin/${targetBranch}`, { stdio: 'ignore' });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Show help message
+ */
+function showHelp() {
+  console.log(`
+📖 PR Generator - Help
+
+Usage:
+  node generate-pr.js [options]
+
+Options:
+  --target, -t <branch>    Target branch (base branch) for PR
+  --auto, -a                Auto-create PR without prompt
+  --draft, -d               Create PR as draft
+  --no-template             Skip template file generation
+  --help, -h                Show this help message
+
+Examples:
+  # Generate PR template only
+  node generate-pr.js
+
+  # Create PR to develop branch automatically
+  node generate-pr.js --target develop --auto
+
+  # Create draft PR to main
+  node generate-pr.js --target main --draft --auto
+
+  # Interactive mode (prompt before creating)
+  node generate-pr.js --target staging
+
+Environment Variables:
+  GOOGLE_AI_API_KEY         Google AI Gemini API key (required)
+  GITHUB_TOKEN              GitHub Personal Access Token (required for --auto)
+  
+Get your tokens:
+  - Google AI: https://aistudio.google.com/app/apikey
+  - GitHub: https://github.com/settings/tokens (scope: repo)
+`);
 }
 
 /**
@@ -737,10 +1139,6 @@ Jika ada perubahan UI, lampirkan screenshot untuk mendemonstrasikan perubahan.
 
 Tambahkan catatan tambahan atau informasi lain yang mungkin perlu diketahui oleh reviewer.
 `;
-
-    if (issueCode) {
-      template += `\n## Related Issue\n\n\`${issueCode}\`\n`;
-    }
   }
 
   fs.writeFileSync('PR_TEMPLATE.md', template);
@@ -755,6 +1153,15 @@ Tambahkan catatan tambahan atau informasi lain yang mungkin perlu diketahui oleh
  * Main function
  */
 async function main() {
+  // Parse command line arguments
+  const args = parseCommandLineArgs();
+  
+  // Show help if requested
+  if (args.showHelp) {
+    showHelp();
+    return;
+  }
+  
   console.log('='.repeat(60));
   console.log('🚀 PR Title & Description Generator (Google AI Gemini)');
   console.log('⚡ Super Fast & FREE!');
@@ -771,6 +1178,16 @@ async function main() {
   // Get git information
   const branchName = getBranchName();
   console.log(`📝 Current branch: ${branchName}`);
+  
+  // Get target branch
+  const targetBranch = getTargetBranch(branchName, args.targetBranch);
+  console.log(`🎯 Target branch: ${targetBranch}`);
+  
+  // Validate target branch exists
+  if (!validateTargetBranch(targetBranch)) {
+    console.log(`⚠️  Warning: Target branch '${targetBranch}' not found on remote`);
+    console.log(`   Will attempt to create PR anyway (branch might exist on remote)`);
+  }
   
   // Get git diff
   console.log('📊 Getting staged changes...');
@@ -800,15 +1217,125 @@ async function main() {
   console.log(`\n📌 TITLE:\n${finalTitle}\n`);
   console.log(`📄 DESCRIPTION:\n${finalDescription.substring(0, 200)}${finalDescription.length > 200 ? '...' : ''}\n`);
   
-  // Save to file
-  createPRTemplate(finalTitle, finalDescription, branchName);
+  // Save to file (unless --no-template)
+  if (!args.skipTemplate) {
+    createPRTemplate(finalTitle, finalDescription, branchName);
+  }
   
-  console.log('\n' + '='.repeat(60));
-  console.log('💡 Next steps:');
-  console.log('   1. Review the generated PR_TEMPLATE.md');
-  console.log('   2. Edit if needed');
-  console.log('   3. Use it when creating your PR on GitHub/GitLab');
-  console.log('='.repeat(60));
+  // Read template content for PR body
+  let templateContent = '';
+  if (fs.existsSync('PR_TEMPLATE.md')) {
+    templateContent = fs.readFileSync('PR_TEMPLATE.md', 'utf-8');
+  } else {
+    // Fallback to description if template not generated
+    templateContent = finalDescription;
+  }
+  
+  // Handle PR creation
+  if (args.autoCreate) {
+    // Auto-create mode
+    const validation = validateGitHubSetup();
+    if (!validation.valid) {
+      console.log(`\n❌ ${validation.error}`);
+      console.log(`   ${validation.message}`);
+      console.log('\n💡 You can still manually create PR using the generated PR_TEMPLATE.md');
+      return;
+    }
+    
+    try {
+      console.log(`\n🚀 Creating PR on GitHub...`);
+      console.log(`   Repository: ${validation.repoInfo.owner}/${validation.repoInfo.repo}`);
+      console.log(`   Branch: ${branchName} -> ${targetBranch}`);
+      
+      const pr = await createGitHubPR(
+        finalTitle,
+        templateContent,
+        branchName,
+        targetBranch,
+        validation.repoInfo
+      );
+      
+      console.log(`\n✅ PR ${pr.number ? 'updated' : 'created'} successfully!`);
+      console.log(`   URL: ${pr.html_url}`);
+      if (pr.number) {
+        console.log(`   Number: #${pr.number}`);
+      }
+    } catch (error) {
+      console.log(`\n❌ Error creating PR: ${error.message}`);
+      if (error.message.includes('401') || error.message.includes('403')) {
+        console.log(`   Please check your GITHUB_TOKEN is valid and has 'repo' scope`);
+        console.log(`   Get token at: https://github.com/settings/tokens`);
+      } else if (error.message.includes('404')) {
+        console.log(`   Repository not found. Check your remote configuration.`);
+      }
+      console.log(`\n💡 You can still manually create PR using the generated PR_TEMPLATE.md`);
+    }
+  } else {
+    // Interactive mode - ask user
+    const readline = require('readline');
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout
+    });
+    
+    rl.question('\n❓ Create PR on GitHub automatically? (y/n): ', async (answer) => {
+      if (answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes') {
+        const validation = validateGitHubSetup();
+        if (!validation.valid) {
+          console.log(`\n❌ ${validation.error}`);
+          console.log(`   ${validation.message}`);
+          rl.close();
+          return;
+        }
+        
+        try {
+          console.log(`\n🚀 Creating PR on GitHub...`);
+          console.log(`   Repository: ${validation.repoInfo.owner}/${validation.repoInfo.repo}`);
+          console.log(`   Branch: ${branchName} -> ${targetBranch}`);
+          if (args.draft) {
+            console.log(`   Mode: Draft PR`);
+          }
+          
+          const pr = await createGitHubPR(
+            finalTitle,
+            templateContent,
+            branchName,
+            targetBranch,
+            validation.repoInfo,
+            args.draft
+          );
+          
+          console.log(`\n✅ PR ${pr.number ? 'updated' : 'created'} successfully!`);
+          console.log(`   URL: ${pr.html_url}`);
+          if (pr.number) {
+            console.log(`   Number: #${pr.number}`);
+          }
+        } catch (error) {
+          console.log(`\n❌ Error creating PR: ${error.message}`);
+          if (error.message.includes('401') || error.message.includes('403')) {
+            console.log(`   Please check your GITHUB_TOKEN is valid and has 'repo' scope`);
+            console.log(`   Get token at: https://github.com/settings/tokens`);
+          } else if (error.message.includes('404')) {
+            console.log(`   Repository not found. Check your remote configuration.`);
+          }
+          console.log(`\n💡 You can still manually create PR using the generated PR_TEMPLATE.md`);
+        }
+      } else {
+        console.log('\n💡 You can manually create PR using the generated PR_TEMPLATE.md');
+      }
+      
+      rl.close();
+    });
+  }
+  
+  if (!args.autoCreate && !args.skipTemplate) {
+    console.log('\n' + '='.repeat(60));
+    console.log('💡 Next steps:');
+    console.log('   1. Review the generated PR_TEMPLATE.md');
+    console.log('   2. Edit if needed');
+    console.log('   3. Use it when creating your PR on GitHub/GitLab');
+    console.log('='.repeat(60));
+  }
 }
 
 // Run main function
