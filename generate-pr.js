@@ -737,10 +737,6 @@ Jika ada perubahan UI, lampirkan screenshot untuk mendemonstrasikan perubahan.
 
 Tambahkan catatan tambahan atau informasi lain yang mungkin perlu diketahui oleh reviewer.
 `;
-
-    if (issueCode) {
-      template += `\n## Related Issue\n\n\`${issueCode}\`\n`;
-    }
   }
 
   fs.writeFileSync('PR_TEMPLATE.md', template);
